@@ -55,7 +55,7 @@ Flag opencv23
 
 Flag opencv24
   Description: Compatability for opencv 2.4
-  Default:     False
+  Default:     True
 
 Library
     Build-Tools:       c2hs >= 0.16.3
