@@ -35,7 +35,7 @@ newtype IOP a b = IOP (a -> IO b)
 
 instance Category IOP where
     id = IOP return
-    (IOP f) . (IOP g)  = IOP $ g >=> (f >>= return)
+    (IOP f) . (IOP g)  = IOP $ g >=> f
 
 (&#&) :: IOP (Image c d) e -> IOP (Image c d) f -> IOP (Image c d) (Image c d,Image c d)
 (IOP f) &#& (IOP g) = IOP $ op
@@ -44,7 +44,7 @@ instance Category IOP where
 
 unsafeOperate op img = unsafePerformIO $ operate op img
 
-runIOP (IOP f) img = withCloneValue img $ \clone -> f clone
+runIOP (IOP f) img = withMutableClone img $ \clone -> f clone
 
 -- |Apply list of image operations to a Copy of an image. (Makes a single copy and is
 -- faster than folding over (<#)
@@ -66,5 +66,5 @@ operateInPlace (ImgOp op) img = op img
 
 unsafeOperateOn img op = unsafePerformIO $ operate op img
 
-operateWithROI pos size (ImgOp op) img = withClone img $ \clone ->
-                                  withIOROI pos size clone (op clone)
+--operateWithROI pos size (ImgOp op) img = withMutableClone img $ \clone ->
+--                                            withIOROI pos size clone (op clone)

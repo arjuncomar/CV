@@ -12,6 +12,7 @@ import System.IO.Unsafe
 import CV.ImageMathOp
 import qualified CV.Matrix as M
 import CV.Matrix (Matrix,withMatPtr)
+import Control.DeepSeq
 
 -- |Since DCT is valid only for even sized images, we provide a
 -- function to crop images to even sizes.
@@ -278,7 +279,8 @@ enlarge :: Int -> Image GrayScale D32 -> Image GrayScale D32
 enlarge n img =  unsafePerformIO $ do
                    i <- I.create (w2,h2)
                    blit i img (0,0)
-                   return i
+                   let (Mutable im) = i
+                   im `deepseq` return im
     where
      (w,h) = getSize img
      (w2,h2) = (pad w, pad h)
@@ -318,7 +320,19 @@ enum LabelType {
 #endif
 
 -- |Mask sizes accepted by distanceTransform
-data MaskSize = M3 | M5 deriving (Eq,Ord,Enum,Show)
+#c
+enum MaskSize {
+     M3 = 3
+    ,M5 = 5
+    ,MPrecise = CV_DIST_MASK_PRECISE
+};
+#endc
+{#enum MaskSize {}#}
+
+
+-- |Mask sizes accepted by distanceTransform
+-- data MaskSize = M3 | M5 | MPrecise deriving (Eq,Ord,Enum,Show)
+
 
 -- |Perform a distance transform on the image
 distanceTransform :: DistanceType -> MaskSize -> Image GrayScale D8 -> Image GrayScale D32 --TODO: Input should be a black and white image
@@ -333,7 +347,6 @@ distanceTransform dtype maskSize source = unsafePerformIO $ do
 #ifdef OpenCV24
                                   (fromIntegral . fromEnum $ CCOMP)
 #endif
-
     return result
 
     -- TODO: Add handling for labels

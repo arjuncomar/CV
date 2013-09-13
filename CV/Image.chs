@@ -1,21 +1,30 @@
-{-#LANGUAGE ForeignFunctionInterface, ViewPatterns,ParallelListComp, FlexibleInstances, FlexibleContexts, TypeFamilies, EmptyDataDecls, ScopedTypeVariables, StandaloneDeriving, DeriveDataTypeable, UndecidableInstances #-}
+{-#LANGUAGE ForeignFunctionInterface, ViewPatterns,ParallelListComp, FlexibleInstances, FlexibleContexts, TypeFamilies, EmptyDataDecls, ScopedTypeVariables, StandaloneDeriving, DeriveDataTypeable, UndecidableInstances, MultiParamTypeClasses #-}
 #include "cvWrapLEO.h"
 module CV.Image (
 -- * Basic types
  Image(..)
+, MutableImage(..)
+, Mask
 , create
+, createWith
 , empty
+, toMutable
+, fromMutable
 , emptyCopy
 , emptyCopy'
 , cloneImage
 , withClone
+, withMask
+, withMutableClone
 , withCloneValue
 , CreateImage
+, Save(..)
 
 -- * Colour spaces
 , ChannelOf
 , GrayScale
 , Complex
+, BGR
 , RGB
 , RGBA
 , RGB_Channel(..)
@@ -61,7 +70,7 @@ module CV.Image (
 , resetROI
 , getRegion
 , withIOROI
-, withROI
+--, withROI
 
 -- * Blitting
 , blendBlit
@@ -94,6 +103,7 @@ module CV.Image (
 , creatingBareImage
 , withGenImage
 , withImage
+, withMutableImage
 , withRawImageData
 , imageFPTR
 , ensure32F
@@ -117,6 +127,7 @@ import Foreign.Concurrent
 import Foreign.Ptr
 import Control.Parallel.Strategies
 import Control.DeepSeq
+import Control.Lens
 
 import CV.Bindings.Error
 
@@ -136,6 +147,7 @@ import Data.Data
 import Data.Typeable
 
 import Utils.GeometryClass
+import Control.Applicative hiding (empty)
 
 
 
@@ -166,6 +178,10 @@ type D64 = Double
 
 -- | The type for Images
 newtype Image channels depth = S BareImage
+newtype MutableImage channels depth = Mutable (Image channels depth)
+
+-- | Alias for images used as masks
+type Mask = Maybe (Image GrayScale D8)
 
 -- | Remove typing info from an image
 unS (S i) = i -- Unsafe and ugly
@@ -187,7 +203,19 @@ withRawImageData (S i) op = withBareImage i $ \pp-> do
 withUniPtr with x fun = with x $ \y ->
                     fun (castPtr y)
 
+withGenImage :: Image c d -> (Ptr b -> IO a) -> IO a
 withGenImage = withUniPtr withImage
+
+-- | This function converts masks to pointers. Masks which are nothing are converted
+--   to null pointers.
+withMask :: Mask -> (Ptr b -> IO a) -> IO a
+withMask (Just i) op = withUniPtr withImage i op
+withMask Nothing  op = op nullPtr
+
+withMutableImage :: MutableImage c d -> (Ptr b -> IO a) -> IO a
+withMutableImage (Mutable i) o = withGenImage i o
+
+withGenBareImage :: BareImage -> (Ptr b -> IO a) -> IO a
 withGenBareImage = withUniPtr withBareImage
 
 {#pointer *IplImage as BareImage foreign newtype#}
@@ -318,6 +346,12 @@ loadColorImage8 :: FilePath -> IO (Maybe (Image BGR D8))
 loadColorImage8 = unsafeloadUsing imageTo8Bit 1
 
 
+instance Sized (MutableImage a b) where
+    type Size (MutableImage a b) = IO (Int,Int)
+   -- getSize :: (Integral a, Integral b) => Image c d -> (a,b)
+    getSize (Mutable i) = evaluate (deep (getSize i))
+
+deep a = a `deepseq` a
 
 instance Sized BareImage where
     type Size BareImage = (Int,Int)
@@ -509,16 +543,20 @@ swapRB img = unsafePerformIO $ do
     return res
 
 
-safeGetPixel :: (Int,Int) -> Image GrayScale D8 -> D8
-safeGetPixel (x,y) i | x<0 || x>= w || y<0 || y>=h = getPixel (x',y') i
-                     | otherwise = 0
+safeGetPixel :: (Sized image, Size image ~ (Int,Int), GetPixel image) => (P image) -> (Int,Int) -> image -> P image
+safeGetPixel def (x,y) i | x<0 || x>= w || y<0 || y>=h = def
+                     | otherwise = getPixel (x,y) i
                 where
                     (w,h) = getSize i
-                    (x',y') = (clamp (0,w-1) x, clamp (0,h-1) y)
+                    -- (x',y') = (clamp (0,w-1) x, clamp (0,h-1) y)
 
 clamp :: Ord a => (a, a) -> a -> a
 clamp (a,b) x = max a (min b x)
 
+instance (NFData (P (Image a b)), GetPixel (Image a b)) => GetPixel (MutableImage a b) where
+    type P (MutableImage a b) = IO (P (Image a b))
+    getPixel xy (Mutable i) = let p = getPixel xy i
+                              in p `deepseq` return p
 
 class GetPixel a where
     type P a :: *
@@ -628,13 +666,13 @@ instance GetPixel (Image LAB D32) where
 -- | Perform (a destructive) inplace map of the image. This should be wrapped inside
 -- withClone or an image operation
 mapImageInplace :: (P (Image GrayScale D32) -> P (Image GrayScale D32))
-            -> Image GrayScale D32
+            -> MutableImage GrayScale D32
             -> IO ()
-mapImageInplace f image = withGenImage image $ \c_i -> do
+mapImageInplace f image = withMutableImage image $ \c_i -> do
              d <- {#get IplImage->imageData#} c_i
              s <- {#get IplImage->widthStep#} c_i
-             let (w,h) = getSize image
-                 cs = fromIntegral s
+             (w,h) <- getSize image
+             let cs = fromIntegral s
                  fs = sizeOf (undefined :: Float)
              forM_ [(x,y) | x<-[0..w-1], y <- [0..h-1]] $ \(x,y) -> do
                    v <- peek (castPtr (d `plusPtr` (y*cs+x*fs)))
@@ -664,6 +702,14 @@ convertTo code channels img = unsafePerformIO $ creatingBareImage $ do
 class CreateImage a where
     -- | Create an image from size
     create :: (Int,Int) -> IO a
+
+createWith :: CreateImage (Image c d) => (Int,Int) -> (MutableImage c d -> IO (MutableImage c d)) -> IO (Image c d)
+createWith s f = do
+    c <- create s
+    Mutable r <- f (Mutable c)
+    return r
+
+
 
 
 instance CreateImage (Image GrayScale D32) where
@@ -695,6 +741,8 @@ instance CreateImage (Image RGB D8) where
 instance CreateImage (Image RGBA D8) where
     create (w,h) = creatingImage $ {#call wrapCreateImage8U#} (fromIntegral w) (fromIntegral h) 4
 
+instance CreateImage (Image c d) => CreateImage (MutableImage c d) where
+    create s = Mutable <$> create s
 
 
 -- | Allocate a new empty image
@@ -735,6 +783,7 @@ primitiveSave filename fpi = do
         withGenBareImage fpi    $ \cvArr ->
          alloca (\defs -> poke defs 0 >> {#call cvSaveImage #} name cvArr defs >> return ())
 
+-- |Save an image as 8 bit gray scale
 saveImage :: (Save (Image c d)) => FilePath -> Image c d ->  IO ()
 saveImage = save
 
@@ -763,49 +812,54 @@ tileImages image1 image2 (x,y) = unsafePerformIO $
                                  creatingImage ({#call simpleMergeImages#}
                                                 i1 i2 x y)
 -- | Blit image2 onto image1.
-blitFix = blit
-blit :: Image GrayScale D32 -> Image GrayScale D32 -> (Int,Int) -> IO ()
-blit image1 image2 (x,y)
-    | badSizes  = error $ "Bad blit sizes: " ++ show [(w1,h1),(w2,h2)]++"<-"++show (x,y)
-    | otherwise = withImage image1 $ \i1 ->
-                   withImage image2 $ \i2 ->
-                    ({#call plainBlit#} i1 i2 (fromIntegral y) (fromIntegral x))
-    where
-     ((w1,h1),(w2,h2)) = (getSize image1,getSize image2)
-     badSizes = x+w2>w1 || y+h2>h1 || x<0 || y<0
+class Blittable channels depth 
+instance Blittable GrayScale D32
+instance Blittable RGB D32
 
--- blitM :: (CreateImage (Image c d)) => (Int,Int) -> [((Int,Int),Image c d)] -> Image c d
-blitM (rw,rh) imgs = resultPic
+blit :: Blittable c d => MutableImage c d -> Image c d -> (Int,Int) -> IO ()
+blit image1 image2 (x,y) = do
+    (w1,h1) <- getSize image1
+    let ((w2,h2)) = getSize image2
+    if x+w2>w1 || y+h2>h1 || x<0 || y<0
+            then error $ "Bad blit sizes: " ++ show [(w1,h1),(w2,h2)]++"<-"++show (x,y)
+            else withMutableImage image1 $ \i1 ->
+                   withImage image2 $ \i2 -> 
+                    ({#call plainBlit#} i1 i2 (fromIntegral y) (fromIntegral x))
+
+-- | Create an image by blitting multiple images onto an empty image.
+blitM :: (CreateImage (MutableImage GrayScale D32)) => 
+    (Int,Int) -> [((Int,Int),Image GrayScale D32)] -> Image GrayScale D32
+blitM (rw,rh) imgs = unsafePerformIO $ resultPic >>= fromMutable 
     where
-     resultPic = unsafePerformIO $ do
+     resultPic = do
                     r <- create (fromIntegral rw,fromIntegral rh)
                     sequence_ [blit r i (fromIntegral x, fromIntegral y)
                               | ((x,y),i) <- imgs ]
                     return r
 
 
-subPixelBlit
-  :: Image c d -> Image c d -> (CDouble, CDouble) -> IO ()
-
-subPixelBlit (image1) (image2) (x,y)
-    | badSizes  = error $ "Bad blit sizes: " ++ show [(w1,h1),(w2,h2)]++"<-"++show (x,y)
-    | otherwise = withImage image1 $ \i1 ->
+subPixelBlit :: MutableImage c d -> Image c d -> (CDouble, CDouble) -> IO ()
+subPixelBlit (image1) (image2) (x,y) = do
+    (w1,h1) <- getSize image1
+    let ((w2,h2)) = getSize image2
+    if ceiling x+w2>w1 || ceiling y+h2>h1 || x<0 || y<0
+     then error $ "Bad blit sizes: " ++ show [(w1,h1),(w2,h2)]++"<-"++show (x,y)
+     else withMutableImage image1 $ \i1 ->
                    withImage image2 $ \i2 ->
                     ({#call subpixel_blit#} i1 i2 y x)
-    where
-     ((w1,h1),(w2,h2)) = (getSize image1,getSize image2)
-     badSizes = ceiling x+w2>w1 || ceiling y+h2>h1 || x<0 || y<0
 
 safeBlit i1 i2 (x,y) = unsafePerformIO $ do
-                  res <- cloneImage i1-- createImage32F (getSize i1) 1
+                  res <- toMutable i1-- createImage32F (getSize i1) 1
                   blit res i2 (x,y)
                   return res
 
 -- | Blit image2 onto image1.
 --   This uses an alpha channel bitmap for determining the regions where the image should be "blended" with
 --   the base image.
+blendBlit :: MutableImage c d -> Image c1 d1 -> Image c3 d3 -> Image c2 d2
+                      -> (CInt, CInt) -> IO ()
 blendBlit image1 image1Alpha image2 image2Alpha (x,y) =
-                               withImage image1 $ \i1 ->
+                               withMutableImage image1 $ \i1 ->
                                 withImage image1Alpha $ \i1a ->
                                  withImage image2Alpha $ \i2a ->
                                   withImage image2 $ \i2 ->
@@ -817,10 +871,25 @@ cloneImage :: Image a b -> IO (Image a b)
 cloneImage img = withGenImage img $ \image ->
                     creatingImage ({#call cvCloneImage #} image)
 
+toMutable :: Image a b -> IO (MutableImage a b)
+toMutable img = withGenImage img $ \image ->
+                    Mutable <$> creatingImage ({#call cvCloneImage #} image)
+
+fromMutable :: MutableImage a b -> IO (Image a b)
+fromMutable (Mutable img) = cloneImage img 
+
 -- | Create a copy of a non-types image
 cloneBareImage :: BareImage -> IO BareImage
 cloneBareImage img = withGenBareImage img $ \image ->
                     creatingBareImage ({#call cvCloneImage #} image)
+
+withMutableClone
+  :: Image channels depth
+     -> (MutableImage channels depth -> IO a)
+     -> IO a
+withMutableClone img fun = do
+                result <- toMutable img
+                fun result
 
 withClone
   :: Image channels depth
@@ -845,20 +914,32 @@ cloneTo64F img = withGenImage img $ \image ->
                 creatingImage
                  ({#call ensure64F #} image)
 
+-- | Convert an image to from arbitrary bit depth into 64 bit, floating point, image.
+--   This conversion does preserve the color space.
+-- Note: this function is named unsafe because it will lose information
+-- from the image. 
 unsafeImageTo64F :: Image c d -> Image c D64
 unsafeImageTo64F img = unsafePerformIO $ withGenImage img $ \image ->
                 creatingImage
                  ({#call ensure64F #} image)
 
+-- | Convert an image to from arbitrary bit depth into 32 bit, floating point, image.
+--   This conversion does preserve the color space.
+-- Note: this function is named unsafe because it will lose information
+-- from the image. 
 unsafeImageTo32F :: Image c d -> Image c D32
 unsafeImageTo32F img = unsafePerformIO $ withGenImage img $ \image ->
                 creatingImage
                  ({#call ensure32F #} image)
 
+-- | Convert an image to from arbitrary bit depth into 8 bit image.
+--   This conversion does preserve the color space.
+-- Note: this function is named unsafe because it will lose information
+-- from the image. 
 unsafeImageTo8Bit :: Image cspace a -> Image cspace D8
-unsafeImageTo8Bit img = unsafePerformIO $ withGenImage img $ \image ->
-                creatingImage
-                 ({#call ensure8U #} image)
+unsafeImageTo8Bit img =
+    unsafePerformIO $ withGenImage img $ \image ->
+              creatingImage ({#call ensure8U #} image)
 
 --toD32 :: Image c d -> Image c D32
 --toD32 i =
@@ -901,73 +982,81 @@ getImageInfo x = do
     return (s,d,c)
 
 
--- Manipulating regions of interest:
+-- | Set the region of interest for a mutable image
+setROI :: (Integral a) => (a,a) -> (a,a) -> MutableImage c d -> IO ()
 setROI (fromIntegral -> x,fromIntegral -> y)
        (fromIntegral -> w,fromIntegral -> h)
-       image = withImage image $ \i ->
+       image = withMutableImage image $ \i ->
                             {#call wrapSetImageROI#} i x y w h
 
-resetROI image = withImage image $ \i ->
+-- | Set the region of interest to cover the entire image.
+resetROI :: MutableImage c d -> IO ()
+resetROI image = withMutableImage image $ \i ->
                   {#call cvResetImageROI#} i
 
-setCOI chnl image = withImage image $ \i ->
-                            {#call cvSetImageCOI#} i (fromIntegral chnl)
-resetCOI image = withImage image $ \i ->
+setCOI :: (Enum a) => a -> MutableImage (ChannelOf a) d -> IO ()
+setCOI chnl image = withMutableImage image $ \i ->
+                            {#call cvSetImageCOI#} i (fromIntegral . (+1) . fromEnum $ chnl) 
+                            -- CV numbers channels starting from 1. 0 means all channels
+
+resetCOI :: MutableImage a d -> IO ()
+resetCOI image = withMutableImage image $ \i ->
                   {#call cvSetImageCOI#} i 0
 
 
--- #TODO: Replace the Int below with proper channel identifier
 getChannel :: (Enum a) => a -> Image (ChannelOf a) d -> Image GrayScale d
 getChannel no image = unsafePerformIO $ creatingImage $ do
     let (w,h) = getSize image
-    setCOI (1+fromEnum no) image
+    mut <- toMutable image
+    setCOI no mut
     cres <- {#call wrapCreateImage32F#} (fromIntegral w) (fromIntegral h) 1
-    withGenImage image $ \cimage ->
+    withMutableImage mut $ \cimage ->
       {#call cvCopy#} cimage (castPtr cres) (nullPtr)
-    resetCOI image
+    resetCOI mut
     return cres
 
+withIOROI :: (Int,Int) -> (Int,Int) -> MutableImage c d -> IO a -> IO a
 withIOROI pos size image op = do
             setROI pos size image
             x <- op
             resetROI image
             return x
 
-withROI :: (Int, Int) -> (Int, Int) -> Image c d -> (Image c d -> a) -> a
-withROI pos size image op = unsafePerformIO $ do
-                        setROI pos size image
-                        let x = op image -- BUG
-                        resetROI image
-                        return x
+--withROI :: (Int, Int) -> (Int, Int) -> Image c d -> (MutableImage c d -> a) -> a
+--withROI pos size image op = unsafePerformIO $ do
+--                        setROI pos size image
+--                        let x = op image -- BUG
+--                        resetROI image
+--                        return x
 
 class SetPixel a where
    type SP a :: *
    setPixel :: (Int,Int) -> SP a -> a -> IO ()
 
-instance SetPixel (Image GrayScale D32) where
-   type SP (Image GrayScale D32) = D32
+instance SetPixel (MutableImage GrayScale D32) where
+   type SP (MutableImage GrayScale D32) = D32
    {-#INLINE setPixel#-}
-   setPixel (x,y) v image = withGenImage image $ \c_i -> do
+   setPixel (x,y) v (image) = withMutableImage image $ \c_i -> do
                                   d <- {#get IplImage->imageData#} c_i
                                   s <- {#get IplImage->widthStep#} c_i
                                   poke (castPtr (d`plusPtr` (y*(fromIntegral s)
                                        + x*sizeOf (0::Float))):: Ptr Float)
                                        v
 
-instance SetPixel (Image GrayScale D8) where
-   type SP (Image GrayScale D8) = D8
+instance SetPixel (MutableImage GrayScale D8) where
+   type SP (MutableImage GrayScale D8) = D8
    {-#INLINE setPixel#-}
-   setPixel (x,y) v image = withGenImage image $ \c_i -> do
+   setPixel (x,y) v (image) = withMutableImage image $ \c_i -> do
                              d <- {#get IplImage->imageData#} c_i
                              s <- {#get IplImage->widthStep#} c_i
                              poke (castPtr (d`plusPtr` (y*(fromIntegral s)
                                   + x*sizeOf (0::Word8))):: Ptr Word8)
                                   v
 
-instance SetPixel (Image RGB D8) where
-    type SP (Image RGB D8) = (D8,D8,D8)
+instance SetPixel (MutableImage RGB D8) where
+    type SP (MutableImage RGB D8) = (D8,D8,D8)
     {-#INLINE setPixel#-}
-    setPixel (x,y) (r,g,b) image = withGenImage image $ \c_i -> do
+    setPixel (x,y) (r,g,b) (image) = withMutableImage image $ \c_i -> do
                                          d <- {#get IplImage->imageData#} c_i
                                          s <- {#get IplImage->widthStep#} c_i
                                          let cs = fromIntegral s
@@ -976,10 +1065,10 @@ instance SetPixel (Image RGB D8) where
                                          poke (castPtr (d`plusPtr` (y*cs +(x*3+1)*fs))) g
                                          poke (castPtr (d`plusPtr` (y*cs +(x*3+2)*fs))) r
 
-instance SetPixel (Image RGB D32) where
-    type SP (Image RGB D32) = (D32,D32,D32)
+instance SetPixel (MutableImage RGB D32) where
+    type SP (MutableImage RGB D32) = (D32,D32,D32)
     {-#INLINE setPixel#-}
-    setPixel (x,y) (r,g,b) image = withGenImage image $ \c_i -> do
+    setPixel (x,y) (r,g,b) (image) = withMutableImage image $ \c_i -> do
                                          d <- {#get IplImage->imageData#} c_i
                                          s <- {#get IplImage->widthStep#} c_i
                                          let cs = fromIntegral s
@@ -988,10 +1077,10 @@ instance SetPixel (Image RGB D32) where
                                          poke (castPtr (d`plusPtr` (y*cs +(x*3+1)*fs))) g
                                          poke (castPtr (d`plusPtr` (y*cs +(x*3+2)*fs))) r
 
-instance SetPixel (Image Complex D32) where
-    type SP (Image Complex D32) = C.Complex D32
+instance SetPixel (MutableImage Complex D32) where
+    type SP (MutableImage Complex D32) = C.Complex D32
     {-#INLINE setPixel#-}
-    setPixel (x,y) (re C.:+ im) image = withGenImage image $ \c_i -> do
+    setPixel (x,y) (re C.:+ im) (image) = withMutableImage image $ \c_i -> do
                              d <- {#get IplImage->imageData#} c_i
                              s <- {#get IplImage->widthStep#} c_i
                              let cs = fromIntegral s
@@ -1016,7 +1105,7 @@ getAllPixelsRowMajor image =  [getPixel (i,j) image
 
 -- |Create a montage form given images (u,v) determines the layout and space the spacing
 --  between images. Images are assumed to be the same size (determined by the first image)
-montage :: (CreateImage (Image GrayScale D32)) => (Int,Int) -> Int -> [Image GrayScale D32] -> Image GrayScale D32
+montage :: (Blittable c d) => (CreateImage (MutableImage c d)) => (Int,Int) -> Int -> [Image c d] -> Image c d
 montage (u',v') space' imgs
     | u'*v' < (length imgs) = error ("Montage mismatch: "++show (u,v, length imgs))
     | otherwise              = resultPic
@@ -1032,7 +1121,8 @@ montage (u',v') space' imgs
                     sequence_ [blit r i (edge +  x*xstep, edge + y*ystep)
                                | y <- [0..v-1] , x <- [0..u-1]
                                | i <- imgs ]
-                    return r
+                    let (Mutable i) = r 
+                    i `seq` return i
 
 data CvException = CvException Int String String String Int
      deriving (Show, Typeable)

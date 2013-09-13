@@ -1,7 +1,7 @@
 Name:				 CV
-Version:             0.3.7
+Version:             0.4.0.0
 Description:         OpenCV Bindings
-License:             GPL
+License:             BSD3
 License-file:        LICENSE
 Category:            AI, Graphics, Machine Vision
 Synopsis:            OpenCV based machine vision library
@@ -57,6 +57,10 @@ Flag opencv24
   Description: Compatability for opencv 2.4
   Default:     True
 
+Flag gpu
+  Description: Include OpenCV GPU modules
+  Default:     False
+
 Library
     Build-Tools:       c2hs >= 0.16.3
     Include-dirs:      cbits/
@@ -65,12 +69,14 @@ Library
                        opencv/highgui.h,
                        cbits/cvWrapLEO.h,
                        cbits/cvWrapCore.h,
+                       cbits/cvWrapCalib.h,
                        cbits/wrapImgProc.h,
                        cbits/cvIterators.h,
                        cbits/cvProjection.h,
                        cbits/cvFiles.h
     c-sources:         cbits/cvWrapLEO.c,
                        cbits/cvWrapCore.c,
+                       cbits/cvWrapCalib.c,
                        cbits/wrapImgProc.c,
                        cbits/cvIterators.c,
                        cbits/cvProjection.c,
@@ -82,17 +88,18 @@ Library
                        cbits/cvProjection.h,
                        cbits/cvFiles.h
     if flag(opencv23)
-        cpp-options: -DOpenCV23
-        cc-options: -DOpenCV23 -std=gnu99
+        cpp-options: -DOpenCV23 -U__BLOCKS__
+        cc-options: -DOpenCV23 -std=gnu99 -U__BLOCKS__
     if flag(opencv24)
-        cpp-options: -DOpenCV24
-        cc-options: -DOpenCV24 -std=gnu99
+        cpp-options: -DOpenCV24 -U__BLOCKS__
+        cc-options: -DOpenCV24 -std=gnu99 -U__BLOCKS__
+    if flag(gpu)
+        extra-libraries:   opencv_gpu
     extra-libraries:   opencv_calib3d,
                        opencv_contrib,
                        opencv_core,
                        opencv_features2d,
                        opencv_flann,
-                       opencv_gpu,
                        opencv_highgui,
                        opencv_imgproc,
                        opencv_legacy,
@@ -105,6 +112,7 @@ Library
                        array >= 0.2.0.0,
                        directory >= 1 && < 2,
                        mtl >= 1.1.0,
+                       lens >= 3.7.0,
                        carray >= 0.1.5,
                        QuickCheck >= 2.1,
                        containers >= 0.2,
@@ -168,6 +176,7 @@ Library
                        ,Utils.Pointer                         
                        ,Utils.Rectangle
                        ,Utils.Stream
+                       ,Utils.ConvexHull
     Other-modules:     CV.Bindings.Matrix,
                        CV.Bindings.Calibrate,
                        CV.Bindings.Fittings,

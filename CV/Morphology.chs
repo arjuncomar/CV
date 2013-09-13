@@ -9,7 +9,9 @@ module CV.Morphology (StructuringElement
                   ,open,close
                   ,erode,dilate
                   ,blackTopHat,whiteTopHat
+                  ,skeletonize
                   ,dilateOp,erodeOp,KernelShape(EllipseShape,CrossShape,RectShape) 
+                  , ConvKernel
                   )
 where
 
@@ -27,7 +29,7 @@ import qualified CV.ImageMath as IM
 import System.IO.Unsafe
 
 -- Morphological opening
-openOp :: StructuringElement -> ImageOperation GrayScale D32
+openOp :: StructuringElement -> ImageOperation GrayScale d
 openOp se = erodeOp se 1 #> dilateOp se 1                    
 open se = unsafeOperate (openOp se) 
 a ○ b = open b a
@@ -35,12 +37,12 @@ a ○ b = open b a
 
 
 -- Morphological closing
-closeOp :: StructuringElement -> ImageOperation GrayScale D32
+closeOp :: StructuringElement -> ImageOperation GrayScale d
 closeOp se = dilateOp se 1 #> erodeOp se 1                    
 close se = unsafeOperate (closeOp se) 
 a ● b = close b a
 
-geodesic :: Image GrayScale D32 -> ImageOperation GrayScale D32 -> ImageOperation GrayScale D32
+geodesic :: Image GrayScale D32 -> ImageOperation GrayScale d -> ImageOperation GrayScale d
 geodesic mask op = op #> IM.limitToOp mask
 
 -- | Perform a black tophat filtering of size
@@ -88,17 +90,21 @@ isGoodSE s@(w,h) d@(x,y) | x>=0 && y>=0
                          | otherwise = False 
 
 
--- Create a structuring element for morphological operations
+-- |Create a structuring element for morphological operations
+-- The first pair is @(width,height)@ while the second is the origin @(x,y)@
+structuringElement :: (Int, Int) -> (Int, Int) -> KernelShape -> StructuringElement
 structuringElement s d | isGoodSE s d = createSE s d 
                        | otherwise = error "Bad values in structuring element"
 
 -- Create SE with custom shape that is taken from flat list shape.
-createSE (w,h) (x,y) shape = unsafePerformIO $ do
+createSE :: (Int, Int) -> (Int, Int) -> KernelShape -> StructuringElement
+createSE (fromIntegral -> w,fromIntegral -> h) (fromIntegral -> x,fromIntegral -> y) shape = unsafePerformIO $ do
     iptr <- {#call cvCreateStructuringElementEx#}
              w h x y (fromIntegral . fromEnum $ shape) nullPtr
     fptr <- newForeignPtr releaseSE iptr
     return (ConvKernel fptr)
 
+customSE :: (CInt, CInt) -> (CInt, CInt) -> [CInt] -> ConvKernel
 customSE s@(w,h) o shape | isGoodSE s o 
                          && length shape == fromIntegral (w*h)
                             = createCustomSE s o shape
@@ -142,3 +148,13 @@ dilate' se count img = withImage img $ \image ->
              {#call cvDilate#} (castPtr image) 
                               (castPtr image) 
                               ck count
+
+skeletonize :: Image GrayScale D8 -> Image GrayScale D8
+skeletonize i = fst . snd . head . dropWhile (\x -> fst x > 0) . iterate (skeletonize'.snd)
+                $ (1,(CV.Image.empty (getSize i),i))
+skeletonize' :: (Image GrayScale D8, Image GrayScale D8) -> (Int, (Image GrayScale D8, Image GrayScale D8))
+skeletonize' (skel,img) = (IM.countNonZero img, (tmp, erode se 1 img))
+    where 
+       tmp = unsafeOperateOn img $ openOp se #> IM.notOp #> IM.andOp img Nothing #> IM.orOp skel Nothing
+       se = structuringElement (3,3) (1,1) CrossShape 
+

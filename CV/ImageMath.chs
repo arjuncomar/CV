@@ -32,14 +32,24 @@ module CV.ImageMath(
 -- , divS
 , minS
 , maxS
+  -- * Pixelwise logical operations
+, CV.ImageMath.not
+, CV.ImageMath.and
+, CV.ImageMath.or
+, CV.ImageMath.notOp
+, CV.ImageMath.andOp
+, CV.ImageMath.orOp
   -- * Comparison operations
 , lessThan
 , moreThan
 , less2Than
 , more2Than
+, lessEq2Than 
+, moreEq2Than
   -- * Image statistics
 , CV.ImageMath.sum
 , average
+, countNonZero
 , averageMask
 , stdDeviation
 , stdDeviationMask
@@ -193,6 +203,32 @@ subMeanAbs = unsafeOperate subtractMeanAbsOp
 --   multiply by @-1@ and add @1@).
 invert i = addS 1 $ mulS (-1) i
 
+notOp :: ImageOperation GrayScale D8
+notOp =  ImgOp $ \image -> withGenImage image $ \i -> {#call cvNot#} i i
+
+not :: Image GrayScale D8 -> Image GrayScale D8
+not = unsafeOperate notOp
+
+andOp :: Image GrayScale D8 -> Mask -> ImageOperation GrayScale D8
+andOp image0 mask = ImgOp $ \image1 -> 
+                  withGenImage image0 $ \ci0 ->
+                  withGenImage image1 $ \ci1 -> 
+                  withMask     mask   $ \cmask -> 
+                  {#call cvAnd#} ci0 ci1 ci1 cmask
+
+and :: Image GrayScale D8 -> Image GrayScale D8 -> Mask -> Image GrayScale D8 
+and i j mask = unsafeOperate (andOp i mask) j
+
+orOp :: Image GrayScale D8 -> Mask -> ImageOperation GrayScale D8
+orOp image0 mask = ImgOp $ \image1 -> 
+                  withGenImage image0 $ \ci0 ->
+                  withGenImage image1 $ \ci1 -> 
+                  withMask     mask   $ \cmask -> 
+                  {#call cvOr#} ci0 ci1 ci1 cmask
+
+or :: Image GrayScale D8 -> Image GrayScale D8 -> Mask -> Image GrayScale D8 
+or i j mask = unsafeOperate (orOp i mask) j
+
 absOp = ImgOp $ \image -> do
                       withGenImage image $ \i ->
                         {#call wrapAbsDiffS#} i 0 i
@@ -312,11 +348,12 @@ moreThan = mkCmpOp cmpGT
 --   @(less2Than A B)@ has white pixels where value of A is less than value of
 --   B. Notice that these functions follow the intuitive order of operands,
 --   unlike 'lessThan' and 'moreThan'.
-less2Than,lessEq2Than,more2Than :: (CreateImage (Image GrayScale d)) => Image GrayScale d
-                                    -> Image GrayScale d -> Image GrayScale D8
+less2Than,lessEq2Than,more2Than, moreEq2Than
+     :: (CreateImage (Image GrayScale d)) => Image GrayScale d -> Image GrayScale d -> Image GrayScale D8
 
 less2Than = mkCmp2Op cmpLT
 lessEq2Than = mkCmp2Op cmpLE
+moreEq2Than = mkCmp2Op cmpGE
 more2Than = mkCmp2Op cmpGT
 
 -- Statistics
@@ -324,6 +361,12 @@ more2Than = mkCmp2Op cmpGT
 average' :: Image GrayScale D32 -> IO D32
 average' img = withGenImage img $ \image -> 
                 {#call wrapAvg#} image nullPtr >>= return . realToFrac
+
+-- | Calculate number of nonzero pixels
+countNonZero :: Image GrayScale a -> Int
+countNonZero img = unsafePerformIO $ withGenImage img $ \cImg -> fromIntegral <$> {#call cvCountNonZero#} cImg 
+
+
 
 -- | Calculates the average pixel value in whole image.
 average :: Image GrayScale D32 -> D32
